@@ -1,0 +1,3 @@
+/home/ubuntu/opencv_project/src/opencv_ws/build/CMakeFiles/palm_center_show_cuda_clinet.dir
+/home/ubuntu/opencv_project/src/opencv_ws/build/CMakeFiles/edit_cache.dir
+/home/ubuntu/opencv_project/src/opencv_ws/build/CMakeFiles/rebuild_cache.dir
