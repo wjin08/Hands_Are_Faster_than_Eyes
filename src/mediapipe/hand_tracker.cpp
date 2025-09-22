@@ -1,55 +1,44 @@
+#include "hand_tracker.h"
+
 #include <iostream>
 #include <vector>
 #include <string>
 #include <chrono>
-#include <cstdlib>
 #include <mutex>
+#include <atomic>
 #include <cmath>
 #include <sstream>
-#include <iomanip>
 #include <thread>
-#include <atomic>
-#include <condition_variable>
-#include <deque>
 
-// POSIX 소켓
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+// OpenCV
+#include <opencv2/opencv.hpp>
 
+// MediaPipe
 #include "mediapipe/framework/calculator_graph.h"
 #include "mediapipe/framework/formats/image_frame.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
-#include "mediapipe/framework/port/logging.h"
-#include "mediapipe/framework/port/ret_check.h"
 #include "mediapipe/framework/port/file_helpers.h"
 
 #include <google/protobuf/text_format.h>
-#include <opencv2/opencv.hpp>
-
-// ==== 서버/인증 상수 ====
-static constexpr const char* kSrvIp   = "10.10.16.73";
-static constexpr int         kSrvPort = 5000;
-static constexpr const char* kMyId    = "1";
-static constexpr const char* kMyPw    = "PASSWD";
 
 using ::mediapipe::CalculatorGraph;
 using ::mediapipe::ImageFrame;
 using ::mediapipe::Packet;
 using ::mediapipe::NormalizedLandmarkList;
 
-// ---------- 유틸 ----------
-static std::unique_ptr<ImageFrame> MatToImageFrameRGB(const cv::Mat& bgr) {
+namespace {
+
+// util
+std::unique_ptr<ImageFrame> MatToImageFrameRGB(const cv::Mat& bgr) {
   auto frame = std::make_unique<ImageFrame>(
-      mediapipe::ImageFormat::SRGB, bgr.cols, bgr.rows,
-      ImageFrame::kDefaultAlignmentBoundary);
+    mediapipe::ImageFormat::SRGB, bgr.cols, bgr.rows,
+    ImageFrame::kDefaultAlignmentBoundary);
   cv::Mat dst(frame->Height(), frame->Width(), CV_8UC3, frame->MutablePixelData());
   cv::cvtColor(bgr, dst, cv::COLOR_BGR2RGB);
   return frame;
 }
 
-static cv::Point2f ComputePalmCenterPx(const NormalizedLandmarkList& lm, int w, int h) {
+cv::Point2f ComputePalmCenterPx(const NormalizedLandmarkList& lm, int w, int h) {
   static const int idxs[] = {0, 1, 5, 9, 13, 17};
   float sx = 0.f, sy = 0.f; int cnt = 0;
   for (int i : idxs) if (i < lm.landmark_size()) {
@@ -60,126 +49,14 @@ static cv::Point2f ComputePalmCenterPx(const NormalizedLandmarkList& lm, int w, 
   return {sx / cnt, sy / cnt};
 }
 
-// ==================== 메시지 큐 & 전송 스레드 ====================
-class MsgQueue {
- public:
-  void push(std::string s) {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (q_.size() > 200) q_.pop_front();
-    q_.push_back(std::move(s));
-    cv_.notify_one();
-  }
-  bool pop_wait(std::string& out, std::atomic<bool>& running) {
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [&]{ return !q_.empty() || !running.load(); });
-    if (!running.load() && q_.empty()) return false;
-    out = std::move(q_.front()); q_.pop_front();
-    return true;
-  }
-  void notify_all() { cv_.notify_all(); }
- private:
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<std::string> q_;
-};
-
-static MsgQueue g_sendq;
-static std::atomic<bool> g_net_running{true};
-
-static int ConnectAndAuth() {
-  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) return -1;
-  sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(kSrvPort);
-  if (::inet_pton(AF_INET, kSrvIp, &addr.sin_addr) != 1) { ::close(sock); return -1; }
-  if (::connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { ::close(sock); return -1; }
-  // 서버는 "id:pw" 형태로 기대. (개행 없이)
-  std::string auth = std::string(kMyId) + ":" + kMyPw;
-  ssize_t n = ::send(sock, auth.c_str(), (int)auth.size(), 0);
-  if (n != (ssize_t)auth.size()) { ::close(sock); return -1; }
-  return sock;
-}
-
-static void SenderThread() {
-  int sock = -1;
-  int backoff_ms = 200;
-  while (g_net_running.load()) {
-    if (sock < 0) {
-      sock = ConnectAndAuth();
-      if (sock >= 0) {
-        std::cerr << "[NET] connected & authed\n";
-        backoff_ms = 200;
-      } else {
-        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-        backoff_ms = std::min(backoff_ms * 2, 3000);
-        continue;
-      }
-    }
-    std::string msg;
-    if (!g_sendq.pop_wait(msg, g_net_running)) break;
-
-    // 2번 클라이언트로만 보냄: "2:<숫자>\n"
-    std::string wire = "2:" + msg;
-    if (wire.empty() || wire.back() != '\n') wire.push_back('\n');
-
-    ssize_t n = ::send(sock, wire.c_str(), (int)wire.size(), 0);
-    if (n != (ssize_t)wire.size()) {
-      std::cerr << "[NET] send fail, reconnecting...\n";
-      ::close(sock); sock = -1;
-    }
-  }
-  if (sock >= 0) ::close(sock);
-  std::cerr << "[NET] sender thread exit\n";
-}
-
-// ==================== 카메라 열기 유틸 ====================
-struct CamTry { int index; int backend; int fourcc; const char* name; };
-
-static bool TryOpen(cv::VideoCapture& cap, const CamTry& t, int w, int h, int fps) {
-  std::cerr << "[CAM] try backend=" << t.name << " idx=" << t.index << "\n";
-  bool ok = (t.backend == cv::CAP_ANY) ? cap.open(t.index) : cap.open(t.index, t.backend);
-  if (!ok) { std::cerr << "[CAM] open fail\n"; return false; }
-  if (w>0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
-  if (h>0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
-  if (fps>0) cap.set(cv::CAP_PROP_FPS, fps);
-  cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-  if (t.fourcc) cap.set(cv::CAP_PROP_FOURCC, t.fourcc);
-  cv::Mat test;
-  if (!cap.read(test) || test.empty()) {
-    std::cerr << "[CAM] read test frame FAIL\n";
-    cap.release(); return false;
-  }
-  std::cerr << "[CAM] OK: " << test.cols << "x" << test.rows << "\n";
-  return true;
-}
-
-static bool OpenCameraAuto(cv::VideoCapture& cap, int& out_w, int& out_h,
-                           int target_w=640, int target_h=480, int fps=30) {
-  const CamTry tries[] = {
-    {0, cv::CAP_V4L2, cv::VideoWriter::fourcc('M','J','P','G'), "V4L2+MJPG"},
-    {0, cv::CAP_V4L2, 0,                                        "V4L2+RAW"},
-    {0, cv::CAP_ANY,  cv::VideoWriter::fourcc('M','J','P','G'), "ANY+MJPG"},
-    {0, cv::CAP_ANY,  0,                                        "ANY+RAW"},
-  };
-  for (auto& t : tries) {
-    if (TryOpen(cap, t, target_w, target_h, fps)) {
-      out_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-      out_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-      std::cerr << "[CAM] final size " << out_w << "x" << out_h << ", fps req=" << fps << "\n";
-      return true;
-    }
-  }
-  return false;
-}
-
-// ==================== 표시 유틸 ====================
-static int MapXTo255(float x_px, int width) {
+int MapXTo255(float x_px, int width) {
   if (width <= 1) return 0;
   float v = (x_px / (float)(width - 1)) * 255.0f;
   v = std::max(0.0f, std::min(255.0f, v));
   return (int)std::lround(v);
 }
 
-static void DrawScaleBar(cv::Mat& img, int value255) {
+void DrawScaleBar(cv::Mat& img, int value255) {
   const int margin = 10;
   const int bar_h = std::max(24, img.rows / 20);
   int y0 = img.rows - bar_h - margin;
@@ -197,7 +74,7 @@ static void DrawScaleBar(cv::Mat& img, int value255) {
   cv::putText(img, label, {margin, y0 - 10}, cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,255,255), 2);
 }
 
-static void DrawFpsOverlay(cv::Mat& img, double fps) {
+void DrawFpsOverlay(cv::Mat& img, double fps) {
   if (img.empty()) return;
   char text[64]; std::snprintf(text, sizeof(text), "FPS: %.1f", fps);
   int baseline = 0; double fontScale = 0.7; int thickness = 2;
@@ -213,39 +90,68 @@ static void DrawFpsOverlay(cv::Mat& img, double fps) {
               cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(255,255,255), thickness);
 }
 
-// ==== 최신 landmark 수신 시각(신선도 체크용) ====
-static std::atomic<long long> g_last_obs_us{0};
+struct CamTry { int index; int backend; int fourcc; const char* name; };
 
-// ==================== main ====================
-int main(int argc, char** argv) {
-  std::string graph_path = "mediapipe/graphs/hand_tracking/hand_tracking_desktop_live.pbtxt";
-  if (argc > 1 && argv[1][0] != '-') graph_path = argv[1];
+bool TryOpen(cv::VideoCapture& cap, const CamTry& t, int w, int h, int fps) {
+  std::cerr << "[CAM] try backend=" << t.name << " idx=" << t.index << "\n";
+  bool ok = (t.backend == cv::CAP_ANY) ? cap.open(t.index) : cap.open(t.index, t.backend);
+  if (!ok) { std::cerr << "[CAM] open fail\n"; return false; }
+  if (w>0) cap.set(cv::CAP_PROP_FRAME_WIDTH,  w);
+  if (h>0) cap.set(cv::CAP_PROP_FRAME_HEIGHT, h);
+  if (fps>0) cap.set(cv::CAP_PROP_FPS, fps);
+  cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+  if (t.fourcc) cap.set(cv::CAP_PROP_FOURCC, t.fourcc);
+  cv::Mat test;
+  if (!cap.read(test) || test.empty()) {
+    std::cerr << "[CAM] read test frame FAIL\n";
+    cap.release(); return false;
+  }
+  std::cerr << "[CAM] OK: " << test.cols << "x" << test.rows << "\n";
+  return true;
+}
 
-  int req_w = 640, req_h = 480, req_fps = 30;
-  int win_w = 1280, win_h = 1000;
-  for (int i=1;i<argc;i++) {
-    std::string a = argv[i];
-    if (a == "--res" && i+1 < argc) {
-      std::string r = argv[++i]; auto x = r.find('x');
-      if (x != std::string::npos) { req_w = std::atoi(r.substr(0,x).c_str()); req_h = std::atoi(r.substr(x+1).c_str()); }
-    } else if (a == "--fps" && i+1 < argc) {
-      req_fps = std::atoi(argv[++i]);
-    } else if (a == "--win" && i+1 < argc) {
-      std::string r = argv[++i]; auto x = r.find('x');
-      if (x != std::string::npos) { win_w = std::atoi(r.substr(0,x).c_str()); win_h = std::atoi(r.substr(x+1).c_str()); }
+bool OpenCameraAuto(cv::VideoCapture& cap, int& out_w, int& out_h,
+                    int target_w=640, int target_h=480, int fps=30) {
+  const CamTry tries[] = {
+    {0, cv::CAP_V4L2, cv::VideoWriter::fourcc('M','J','P','G'), "V4L2+MJPG"},
+    {0, cv::CAP_V4L2, 0,                                        "V4L2+RAW"},
+    {0, cv::CAP_ANY,  cv::VideoWriter::fourcc('M','J','P','G'), "ANY+MJPG"},
+    {0, cv::CAP_ANY,  0,                                        "ANY+RAW"},
+  };
+  for (auto& t : tries) {
+    if (TryOpen(cap, t, target_w, target_h, fps)) {
+      out_w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+      out_h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+      std::cerr << "[CAM] final size " << out_w << "x" << out_h << ", fps req=" << fps << "\n";
+      return true;
     }
   }
+  return false;
+}
 
-  bool gui_ok = (std::getenv("DISPLAY") || std::getenv("WAYLAND_DISPLAY"));
-  for (int i=1;i<argc;i++) {
-    if (std::string(argv[i]) == "--no-gui") gui_ok = false;
-    if (std::string(argv[i]) == "--gui")    gui_ok = true;
-  }
-  std::cerr << "[APP] GUI " << (gui_ok ? "ENABLED" : "DISABLED (headless)") << "\n";
+static std::atomic<long long> g_last_obs_us{0};
 
+} // namespace
+
+// ===== HandTracker =====
+HandTracker::HandTracker(int req_w, int req_h, int req_fps, bool gui,
+                         std::function<void(int)> on_value)
+  : req_w_(req_w), req_h_(req_h), req_fps_(req_fps), gui_(gui),
+    on_value_(std::move(on_value)) {}
+
+bool HandTracker::init(const std::string& graph_path) {
+  (void)graph_path; // 실제 초기화는 run()에서 수행
+  return true;
+}
+
+int HandTracker::run() {
+  // MediaPipe 그래프 로드
+  std::string graph_path = "mediapipe/graphs/hand_tracking/hand_tracking_desktop_live.pbtxt";
   std::string graph_config_contents;
-  absl::Status fs = mediapipe::file::GetContents(graph_path, &graph_config_contents);
-  if (!fs.ok()) { std::cerr << fs.message() << "\n"; return 1; }
+  {
+    absl::Status fs = mediapipe::file::GetContents(graph_path, &graph_config_contents);
+    if (!fs.ok()) { std::cerr << fs.message() << "\n"; return 1; }
+  }
 
   mediapipe::CalculatorGraphConfig config;
   if (!google::protobuf::TextFormat::ParseFromString(graph_config_contents, &config)) {
@@ -254,8 +160,10 @@ int main(int argc, char** argv) {
   }
 
   CalculatorGraph graph;
-  absl::Status st = graph.Initialize(config);
-  if (!st.ok()) { std::cerr << st.message() << "\n"; return 1; }
+  {
+    absl::Status st = graph.Initialize(config);
+    if (!st.ok()) { std::cerr << st.message() << "\n"; return 1; }
+  }
 
   const std::vector<std::string> kCandidateStreams = {"multi_hand_landmarks","hand_landmarks","landmarks"};
   std::string landmarks_stream_used;
@@ -273,7 +181,6 @@ int main(int argc, char** argv) {
           std::lock_guard<std::mutex> lk(latest_mu);
           latest_hands = v; has_latest = true;
         }
-        // 콜백이 올 때마다 최신 수신 시각 갱신
         auto tp = std::chrono::steady_clock::now();
         long long us = std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();
         g_last_obs_us.store(us, std::memory_order_relaxed);
@@ -282,25 +189,24 @@ int main(int argc, char** argv) {
     );
     if (obs.ok()) { landmarks_stream_used = name; observe_ok = true; break; }
   }
-  if (!observe_ok) { std::cerr << "No landmarks stream found (tried multi_hand_landmarks, hand_handmarks, landmarks)\n"; return 1; }
+  if (!observe_ok) { std::cerr << "No landmarks stream found\n"; return 1; }
   std::cout << "[INFO] Using landmarks stream: " << landmarks_stream_used << "\n";
 
   const std::string kInput = "input_video";
 
   cv::VideoCapture cap;
   int cam_w=0, cam_h=0;
-  if (!OpenCameraAuto(cap, cam_w, cam_h, req_w, req_h, req_fps)) {
+  if (!OpenCameraAuto(cap, cam_w, cam_h, req_w_, req_h_, req_fps_)) {
     std::cerr << "Cannot open camera (all backends tried)\n"; return 1;
   }
 
-  st = graph.StartRun({});
-  if (!st.ok()) { std::cerr << st.message() << "\n"; return 1; }
-
-  // ---- 전송 스레드 시작 ----
-  std::thread sender(SenderThread);
+  {
+    absl::Status st = graph.StartRun({});
+    if (!st.ok()) { std::cerr << st.message() << "\n"; return 1; }
+  }
 
   const char* kWinName = "Hand -> X(0~255)";
-  if (gui_ok) { cv::namedWindow(kWinName, cv::WINDOW_NORMAL); cv::resizeWindow(kWinName, win_w, win_h); }
+  if (gui_) { cv::namedWindow(kWinName, cv::WINDOW_NORMAL); cv::resizeWindow(kWinName, 1280, 1000); }
 
   int frames = 0;
   auto t0 = std::chrono::steady_clock::now();
@@ -308,6 +214,8 @@ int main(int argc, char** argv) {
   auto last_frame_tp = std::chrono::steady_clock::now();
 
   cv::Mat frame_bgr;
+  auto last_send_tp = std::chrono::steady_clock::now();
+
   while (true) {
     if (!cap.read(frame_bgr) || frame_bgr.empty()) { cv::waitKey(1); continue; }
     if (frame_bgr.cols != cam_w || frame_bgr.rows != cam_h) {
@@ -317,11 +225,13 @@ int main(int argc, char** argv) {
     auto nowtp = std::chrono::steady_clock::now();
     int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(nowtp.time_since_epoch()).count();
 
-    // 제출
+    // MediaPipe 제출
     auto input_frame = MatToImageFrameRGB(frame_bgr);
     Packet packet = mediapipe::Adopt(input_frame.release()).At(mediapipe::Timestamp(now_us));
-    st = graph.AddPacketToInputStream(kInput, packet);
-    if (!st.ok()) { std::cerr << "[MP] AddPacket fail: " << st.message() << "\n"; break; }
+    {
+      absl::Status st = graph.AddPacketToInputStream(kInput, packet);
+      if (!st.ok()) { std::cerr << "[MP] AddPacket fail: " << st.message() << "\n"; break; }
+    }
 
     // 최신 결과 복사
     std::vector<NormalizedLandmarkList> hands_copy;
@@ -330,7 +240,7 @@ int main(int argc, char** argv) {
       if (has_latest) hands_copy = latest_hands;
     }
 
-    // ===== 신선도 체크 (손 없을 때 표시/전송 끔) =====
+    // 신선도 체크
     constexpr long long kFreshThreshUs = 300000; // 300ms
     bool hands_fresh = (now_us - g_last_obs_us.load(std::memory_order_relaxed)) <= kFreshThreshUs;
     bool hands_visible = hands_fresh && !hands_copy.empty();
@@ -338,38 +248,34 @@ int main(int argc, char** argv) {
     int primary_x255 = -1;
 
     if (hands_visible) {
-      // 맵핑/표시
       for (size_t i = 0; i < hands_copy.size(); ++i) {
         const auto& lm = hands_copy[i];
         auto palm = ComputePalmCenterPx(lm, frame_bgr.cols, frame_bgr.rows);
         if (palm.x >= 0 && palm.y >= 0) {
           int x255 = MapXTo255(palm.x, frame_bgr.cols);
           if (i == 0) primary_x255 = x255;
-          // 좌표(원+텍스트)도 손이 보일 때만
-          cv::circle(frame_bgr, palm, 8, cv::Scalar(0,255,0), -1);
-          char buf[64]; snprintf(buf, sizeof(buf), "hand%zu X255=%d", i, x255);
-          cv::putText(frame_bgr, buf, palm + cv::Point2f(10,-10),
-                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 2);
+
+          if (gui_) {
+            cv::circle(frame_bgr, palm, 8, cv::Scalar(0,255,0), -1);
+            char buf[64]; snprintf(buf, sizeof(buf), "hand%zu X255=%d", i, x255);
+            cv::putText(frame_bgr, buf, palm + cv::Point2f(10,-10),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 2);
+          }
         }
       }
-
-      if (primary_x255 >= 0) {
+      if (gui_ && primary_x255 >= 0) {
         DrawScaleBar(frame_bgr, primary_x255);
-
-        // 콘솔 표시(디버그)
-        std::cout << "X255=" << primary_x255 << std::endl;
-
-        // 15Hz로 전송 — 페이로드는 숫자만
-        static auto last_send_tp = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(nowtp - last_send_tp).count() >= (1.0/15.0)) {
-          last_send_tp = nowtp;
-          g_sendq.push(std::to_string(primary_x255));
-        }
       }
     }
-    // hands_visible == false 이면: 아무 것도 그리지/보내지 않음
 
-    // FPS 계산/표시
+    // 15Hz 레이트로 콜백 호출(손 없으면 0)
+    if (std::chrono::duration<double>(nowtp - last_send_tp).count() >= (1.0/15.0)) {
+      last_send_tp = nowtp;
+      int value_to_send = (hands_visible && primary_x255 >= 0) ? primary_x255 : 0;
+      if (on_value_) on_value_(value_to_send);
+    }
+
+    // FPS overlay
     double inst_dt = std::chrono::duration<double>(nowtp - last_frame_tp).count();
     last_frame_tp = nowtp;
     double inst_fps = (inst_dt > 0.0) ? (1.0 / inst_dt) : 0.0;
@@ -383,26 +289,17 @@ int main(int argc, char** argv) {
       frames++;
     }
 
-    DrawFpsOverlay(frame_bgr, fps_display);
-
-    if (gui_ok) {
-      const char* kWinName = "Hand -> X(0~255)";
-      std::ostringstream title;
-      title << kWinName << "  |  FPS: " << std::fixed << std::setprecision(1) << fps_display;
-      cv::setWindowTitle(kWinName, title.str());
+    if (gui_) {
+      DrawFpsOverlay(frame_bgr, fps_display);
+      cv::setWindowTitle(kWinName, (std::ostringstream() << kWinName
+                        << "  |  FPS: " << std::fixed << std::setprecision(1) << fps_display).str());
       cv::imshow(kWinName, frame_bgr);
       int key = cv::waitKey(1);
       if (key == 27) break; // ESC
     }
   }
 
-  // 종료 정리
   graph.CloseInputStream("input_video");
   graph.WaitUntilDone();
-
-  g_net_running.store(false);
-  g_sendq.notify_all();
-  // sender는 동일 스코프
-  // (주의: try/catch 필요시 추가)
   return 0;
 }
