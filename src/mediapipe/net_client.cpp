@@ -32,7 +32,13 @@ void NetClient::stop() {
 void NetClient::send_value(int value) {
   if (value < 0) value = 0;
   if (value > 255) value = 255;
-  push_(std::to_string(value));
+
+  // 항상 LED@ + 2자리 대문자 HEX (00~FF)
+  std::ostringstream oss;
+  oss << "LED@0x" << std::hex
+      << std::setw(2) << std::setfill('0') << value;
+
+  push_(oss.str());
 }
 
 void NetClient::push_(std::string s) {

@@ -5,12 +5,14 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
+#include <iomanip>
+#include <sstream>
 
 class NetClient {
 public:
   NetClient(std::string server_ip, int server_port,
             std::string my_id, std::string my_pw,
-            std::string to_id = "2");
+            std::string to_id = "KSH_QT");
   ~NetClient();
 
   void start();
