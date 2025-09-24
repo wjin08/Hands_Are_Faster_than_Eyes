@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Tab2SocketClient</class>
+ <widget class="QWidget" name="Tab2SocketClient">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>400</width>
+    <height>300</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Form</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_2">
+   <item>
+    <layout class="QVBoxLayout" name="verticalLayout">
+     <item>
+      <layout class="QHBoxLayout" name="horizontalLayout" stretch="6,2,2">
+       <item>
+        <widget class="QLabel" name="label">
+         <property name="text">
+          <string>수신 데이터</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pPBrecvDataClear">
+         <property name="text">
+          <string>수신 삭제</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pPBserverConnect">
+         <property name="text">
+          <string>서버 연결</string>
+         </property>
+         <property name="checkable">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <widget class="QTextEdit" name="pTErecvData"/>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="horizontalLayout_2" stretch="3,6,1">
+       <item>
+        <widget class="QLineEdit" name="pLErecvId"/>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="pLEsendData"/>
+       </item>
+       <item>
+        <widget class="QPushButton" name="pPBSend">
+         <property name="text">
+          <string>송신</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>pLEsendData</sender>
+   <signal>returnPressed()</signal>
+   <receiver>pPBSend</receiver>
+   <slot>click()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>205</x>
+     <y>273</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>335</x>
+     <y>277</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>
