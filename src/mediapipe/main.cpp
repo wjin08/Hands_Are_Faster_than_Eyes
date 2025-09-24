@@ -5,9 +5,9 @@
 
 int main(int argc, char** argv) {
   // 서버 설정 (기존 상수와 동일)
-  const char* kSrvIp = "10.10.16.73";
+  const char* kSrvIp = "10.10.16.243";
   const int   kSrvPort = 5000;
-  const char* kMyId  = "1";
+  const char* kMyId  = "3";
   const char* kMyPw  = "PASSWD";
 
   bool gui = true;
