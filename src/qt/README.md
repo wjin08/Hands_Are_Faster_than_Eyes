@@ -3,6 +3,10 @@
 ## 개요
 라즈베리파이의 LED를 원격으로 제어하고 모니터링 하는 Qt 기반 클라이언트-서버 시스템입니다. 여러 클라이언트가 동시에 접속하여 실시간으로 LED 상태를 공유하고 제어할 수 있습니다.
 
+<img width="400" height="429" alt="스크린샷 2025-09-23 151059" src="https://github.com/user-attachments/assets/3d09f242-72fa-4dd0-bbda-0435dda5d991" /> 
+
+<img width="481" height="519" alt="스크린샷 2025-09-24 155903" src="https://github.com/user-attachments/assets/5f80875e-56dc-4218-9f5c-7535873add10" />
+
 
 
 ## 주요 기능
